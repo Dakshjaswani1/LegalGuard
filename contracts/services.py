@@ -1,7 +1,9 @@
 import json
 import os
+import re
 from typing import TypedDict,List
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, START, END
 from .schemas import AuditResultSchema
 from langchain_core.prompts import ChatPromptTemplate
@@ -11,7 +13,9 @@ from langchain_core.prompts import ChatPromptTemplate
 llm_endpoint=HuggingFaceEndpoint(
     repo_id="Qwen/Qwen2.5-7B-Instruct",
     task="text-generation",
-    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+    timeout=300,
+    max_new_tokens=2048,
 )
 
 model=ChatHuggingFace(llm=llm_endpoint)
@@ -26,36 +30,63 @@ class AgentState(TypedDict):
 # 3 Logic node
 
 def audit_contract_node(state:AgentState):
-    # we convert our pydantic schema into JSON structure AI can understand
+    # we use langchain's parser to help clean the output later
 
-    json_schema=json.dumps(AuditResultSchema.model_json_schema(),indent=2)
+    parser=JsonOutputParser(pydantic_object=AuditResultSchema)
+    retry_count=state.get("retry_count",0)
+
+    # error_context=""
+    # if state["errors"] and retry_count > 0:
+    #     error_context=f"\n\nPREVIOUS ERROR: {state['error'][-1]}\n Please fix the JSON formatting and try again."
+
 
     prompt=f"""
-    You are a senior legal auditor. Analyze the following contract text.
-    You MUST respond in valid JSON that matches the schema:
-    {json_schema}
+    SYSTEM: You are a professional legal auditor.
+    TASK: Analyze the contract text provided.
 
-    contract_text:
+    INSTRUCTIONS:
+    - Identify legal risks and suggest safer alternatives.
+    - Return ONLY the final JSON object.
+    - DO NOT include the schema defination or preamble.
+    - Ensure 'is_complaint' is a boolean.
+
+    {parser.get_format_instructions()}
+    
+    CONTRACT TEXT:
     {state['contract_text'][:3000]}
+
     """
 
     response=model.invoke(prompt)
-
+    content=response.content
     try:
-        # we parse the AI's streing response into a python dictinary
-        # in a senior setup, we'd handle the ```json' markdown wrapper if the AI adds it
+       # 1 Look for JSON inside markdown blocks first
+       
+        json_match=re.findall(r'```json\s*(.*?)\s*```',content,re.DOTALL)
+        if json_match:
+            # if multiple blocks take the last one (usually the data not the schema)
+            json_str=json_match[-1]
+        else:
+            # 2 fallback: find everything between first '{' and last '}'
+            # we avoid recursion and just use a greedy match
 
-        content=response.content.replace("```json","").replace("```","").strip()
-        raw_data=json.loads(content)
+            match=re.search(r'(\{.*\})',content,re.DOTALL)
+            json_str=match.group(1) if match else content
+        
+        # 3 use pydantic  to validate that the fields match our schema
+        raw_data=json.loads(json_str)
 
-        #pydantic validates the data. If it's wrong, it throws and error
-
+        # if the model include the schema metadata dive into the actual property
+        if "properties" in raw_data and "summary" not in raw_data:
+            return {"errors":["AI returned schema instead of data. Please try again"]}
+        
         validated=AuditResultSchema(**raw_data)
-
         return {"audit_data":validated.model_dump()}
+    
     except Exception as e:
-        return {"errors":[f"AI formatting error: {str(e)}"]}
-
+        return {"errors":[f"Parsing error:{str(e)}"],
+                "audit_data":{}}
+           
 
 # 4 building workflow
 
