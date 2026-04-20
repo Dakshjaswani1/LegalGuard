@@ -15,7 +15,7 @@ def run_test():
     print("--- Starting AI Audit Test ---")
     
     # 2. Get the contract (Senior Tip: check if it exists first)
-    contract = Contract.objects.first()
+    contract = Contract.objects.get(title="test_new")
     if not contract:
         print("Error: No contract found in DB. Upload one via the browser first!")
         return

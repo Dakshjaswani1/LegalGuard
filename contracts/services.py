@@ -1,14 +1,16 @@
 import json
 import os
 import re
-from typing import TypedDict,List
+from datetime import datetime
+from typing import TypedDict,List,Literal
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, START, END
 from .schemas import AuditResultSchema
 from langchain_core.prompts import ChatPromptTemplate
-#we create a prompt that tells AI to behave like a JSON generator
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 
+#we create a prompt that tells AI to behave like a JSON generator
 #1 setup Model (Qwen 2.5 will be best-in-class for following JSON )
 llm_endpoint=HuggingFaceEndpoint(
     repo_id="Qwen/Qwen2.5-7B-Instruct",
@@ -20,81 +22,134 @@ llm_endpoint=HuggingFaceEndpoint(
 
 model=ChatHuggingFace(llm=llm_endpoint)
 
-# 2 define StateGraph
+# 2 file extraction logic
+
+def extract_text_from_file(file_path):
+    """Agnostic loader based on extension."""
+    ext=os.path.splitext(file_path)[1].lower()
+
+    if ext==".pdf":
+        loader=PyPDFLoader(file_path)
+    elif ext in [".docx", ".doc"]:
+        loader=Docx2txtLoader(file_path)
+    else:
+        with open(file_path,'r',encoding="utf-8",errors="ignore") as f:
+            return f.read()
+    
+    docs=loader.load()
+    return "\n".join([doc.page_content for doc in docs])
+
+# 2 AI Agent logic
 
 class AgentState(TypedDict):
     contract_text:str
     audit_data:dict #This will store validated pydantic data
     errors:List[str]
+    critique:str #stores the senior partner feedback
+    retry_count:int # tracks how many times we have tried to fix it
 
-# 3 Logic node
 
-def audit_contract_node(state:AgentState):
-    # we use langchain's parser to help clean the output later
+# senior tool deterministic validator
+def deterministic_checks(text:str)->List[dict]:
+    """Catches mistakes LLMs often miss using pure python logic."""
+    issues=[]
 
-    parser=JsonOutputParser(pydantic_object=AuditResultSchema)
-    retry_count=state.get("retry_count",0)
+    if "â‚" in text or "Â" in text:
+        issues.append({
+            "clause_name":"Document Integrity",
+            "risk_level":"Medium",
+            "explanation":"Character encoding error detected (e.g.,'â‚¹'). This indicates a professional drafting error.",
+            "suggestion":"Fix character encoding to correctly display symbols like ₹."
+        })
 
-    # error_context=""
-    # if state["errors"] and retry_count > 0:
-    #     error_context=f"\n\nPREVIOUS ERROR: {state['error'][-1]}\n Please fix the JSON formatting and try again."
+    # check 2 simpler date validation( April 31/32, etc..)
+    # this is a bassic regex; a real app would use libraries like 'dateparser'
+    date_matches=re.findall(r'(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|June|July|August|September|October|Novmeber|December)\s+(\d{4})',text)
+    for day,month,year in date_matches:
+        try:
+            datetime.strptime(f"{day} {month} {year}","%d %B %Y")
+        except ValueError:
+            issues.append({
+                "clause_name":"Dates",
+                "risk_level":"High",
+                "explanation":f"Invalid date detected: '{day} {month} {year}'.",
+                "suggestion":"Correct the calender date to a valid date"    
+            })
+    return issues
 
+
+# 3 Node 1 : The Initial Auditor
+def audit_node(state:AgentState):
+    parser=JsonOutputParser(pydantic_object=AuditResultSchema)\
+    
+    # we incldue the critique if this is a retry
+    critique_context=f"\n\nSENIOR REVIEW FEEDBACK: {state.get('critique','')}\nPlease address these misses." if state.get('critique') else ""
 
     prompt=f"""
-    SYSTEM: You are a professional legal auditor.
-    TASK: Analyze the contract text provided.
-
-    INSTRUCTIONS:
-    - Identify legal risks and suggest safer alternatives.
-    - Return ONLY the final JSON object.
-    - DO NOT include the schema defination or preamble.
-    - Ensure 'is_complaint' is a boolean.
+    SYSTEM: You are an expert legal auditor.
+    TASK: Analyze the contract. Use this CHECKLIST:
+    1. Identify all parties (Name, Address, Identity)
+    2. Validate all Dates and Deliverables.
+    3. Check Scope (Flag 'Unlimited' or 'without limitation').
+    4. Verify Indemnity and Force Major clauses.
 
     {parser.get_format_instructions()}
-    
+    {critique_context}
+
     CONTRACT TEXT:
-    {state['contract_text'][:3000]}
-
+    {state['contract_text'][:4000]}
     """
-
     response=model.invoke(prompt)
-    content=response.content
+
     try:
-       # 1 Look for JSON inside markdown blocks first
-       
-        json_match=re.findall(r'```json\s*(.*?)\s*```',content,re.DOTALL)
-        if json_match:
-            # if multiple blocks take the last one (usually the data not the schema)
-            json_str=json_match[-1]
-        else:
-            # 2 fallback: find everything between first '{' and last '}'
-            # we avoid recursion and just use a greedy match
+        #Extract last JSON block'
+        json_str=re.findall(r'(\{.*\})',response.content,re.DOTALL)[-1]
+        data=json.loads(json_str)
 
-            match=re.search(r'(\{.*\})',content,re.DOTALL)
-            json_str=match.group(1) if match else content
-        
-        # 3 use pydantic  to validate that the fields match our schema
-        raw_data=json.loads(json_str)
+        #Merge deterministic issues into LLM findings
+        det_issues=deterministic_checks(state['contract_text'])
+        data['findings'].extend(det_issues)
 
-        # if the model include the schema metadata dive into the actual property
-        if "properties" in raw_data and "summary" not in raw_data:
-            return {"errors":["AI returned schema instead of data. Please try again"]}
-        
-        validated=AuditResultSchema(**raw_data)
-        return {"audit_data":validated.model_dump()}
-    
+        return {"audit_data":data,"retry_count":state.get("retry_count",0)+1}
     except Exception as e:
-        return {"errors":[f"Parsing error:{str(e)}"],
-                "audit_data":{}}
-           
+        return {"errors":[str(e)]}
 
-# 4 building workflow
+def critique_node(state:AgentState):
+    """The 'Reviewer' node that specifically looks for what the auditor missed."""
+    findings=json.dumps(state["audit_data"])
+    prompt=f"""
+    You are a Senior Legal Partner. Review the findings of Junior Auditor.
+    Findings:{findings}
+
+    Check for:
+    - Missed 'Unlimited' scope?
+    - Missed missing Indemnity?
+    - Missed missing Deliverables?
+    - Are the risk levels too low (e.g. Scope should be HIGH)?
+
+    If it's perfect say 'APPROVED'. Otherwise, list the missing issue.
+
+"""
+    response=model.invoke(prompt)
+    return {"critique":response.content}
+
+# 5 Routing Logic
+def should_continue(state:AgentState):
+    if "APPROVED" in state['critique'] or state['retry_count'] >= 2:
+        return "end"
+    return "retry"
+
+
+# 6 build graph
 
 workflow=StateGraph(AgentState)
-workflow.add_node("auditor",audit_contract_node)
+workflow.add_node("auditor",audit_node)
+workflow.add_node("critiquer",critique_node)
 workflow.add_edge(START,"auditor")
-workflow.add_edge("auditor",END)
+workflow.add_edge("auditor","critiquer")
+workflow.add_conditional_edges("critiquer", should_continue,{
+    "retry":"auditor",
+    "end":END
+})
 
-
-# compile 
 contract_agent=workflow.compile()

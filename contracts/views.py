@@ -3,7 +3,7 @@ from .models import Contract
 from .serializers import ContractSerializer
 from rest_framework import viewsets,status
 from rest_framework.decorators import action
-from .services import contract_agent
+from .services import contract_agent, extract_text_from_file
 from rest_framework.response import Response
 
 
@@ -18,8 +18,7 @@ class ContractViewSet(viewsets.ModelViewSet):
 
         # 1 Read the text from the uploaded file
         try:
-            with contract.file.open('r') as f:
-                content=f.read()
+            content=extract_text_from_file(contract.file.path)
         except Exception:
             return Respose({"error":"Could not read file"},status=status.HTTP_400_BAD_REQUEST)
         
